@@ -25,6 +25,7 @@
 
 import type { Plugin } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
+import { createHash } from "crypto"
 import { homedir } from "os"
 import path from "path"
 
@@ -66,6 +67,11 @@ function stateDirFor(sessionID: string): string {
   return path.join(homedir(), ".config", "opencode", "rlm-state", sessionID)
 }
 
+function lakeFileFor(projectDir: string): string {
+  const hash = createHash("sha256").update(projectDir).digest("hex").slice(0, 16)
+  return path.join(homedir(), ".config", "opencode", "rlm-state", "lake", `${hash}.jsonl`)
+}
+
 function unwrap<T>(res: any): T {
   return (res?.data ?? res) as T
 }
@@ -91,7 +97,7 @@ class Kernel {
   readonly directory: string
   readonly ready: Promise<void>
 
-  constructor(python: string, kernelFile: string, sessionID: string, directory: string) {
+  constructor(python: string, kernelFile: string, sessionID: string, directory: string, lakeFile?: string) {
     this.sessionID = sessionID
     this.directory = directory
     this.proc = Bun.spawn([python, kernelFile], {
@@ -99,6 +105,7 @@ class Kernel {
       stdout: "pipe",
       stderr: "pipe",
       cwd: directory,
+      env: lakeFile ? { ...process.env, RLM_LAKE_FILE: lakeFile } : process.env,
     })
     this.ready = new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error("kernel did not announce ready")), 10_000)
@@ -258,9 +265,183 @@ class Kernel {
   }
 }
 
+// ─── Context Lake (context folding — RLM paper arXiv:2512.24601) ────────────
+// The other half of RLM: context as an external resource accessed via tools.
+// Large data stored here NEVER enters the LLM prompt; the model retrieves
+// only what it needs with rlm_get / rlm_search / rlm_find.
+
+const LAKE_CAPTURE_MIN_CHARS = 10_000   // auto-capture tool outputs above this
+const LAKE_MAX_ENTRIES = 500            // hard cap on auto-captured entries
+const LAKE_GET_MAX_CHARS = 50_000       // rlm_get returns at most this much
+
+interface LakeEntry {
+  key: string
+  content: string
+  tags: string[]
+  source: "model" | "tool-capture" | "user"
+  created: number
+  updated: number
+}
+
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+}
+
+class ContextLake {
+  private file: string
+  private entries = new Map<string, LakeEntry>()
+  private loadPromise: Promise<void> | null = null
+  private lastMtime = 0
+
+  constructor(projectDir: string) {
+    this.file = lakeFileFor(projectDir)
+  }
+
+  private async ensureLoaded(): Promise<void> {
+    if (!this.loadPromise) this.loadPromise = this.load()
+    await this.loadPromise
+    // Reload when the file changed on disk (the kernel writes entries via
+    // rlm_lake.store and must be visible to the plugin tools).
+    try {
+      const stat = await Bun.file(this.file).stat()
+      if (stat.mtimeMs > this.lastMtime) {
+        this.lastMtime = stat.mtimeMs
+        await this.load()
+      }
+    } catch {}
+  }
+
+  private async load() {
+    this.entries.clear()
+    try {
+      const f = Bun.file(this.file)
+      if (await f.exists()) {
+        const stat = await f.stat()
+        this.lastMtime = stat.mtimeMs
+        const text = await f.text()
+        for (const line of text.split("\n")) {
+          if (!line.trim()) continue
+          try {
+            const e = JSON.parse(line) as LakeEntry
+            if (e?.key) this.entries.set(e.key, e)
+          } catch {}
+        }
+      }
+    } catch {}
+  }
+
+  private async append(entry: LakeEntry) {
+    await Bun.write(this.file, JSON.stringify(entry) + "\n", { append: true })
+  }
+
+  private async rewrite() {
+    const lines = [...this.entries.values()].map((e) => JSON.stringify(e)).join("\n")
+    await Bun.write(this.file, lines ? lines + "\n" : "")
+  }
+
+  async store(
+    key: string,
+    content: string,
+    tags: string[] = [],
+    source: LakeEntry["source"] = "model"
+  ): Promise<LakeEntry> {
+    await this.ensureLoaded()
+    const now = Date.now()
+    const entry: LakeEntry = {
+      key,
+      content,
+      tags,
+      source,
+      created: this.entries.get(key)?.created ?? now,
+      updated: now,
+    }
+    this.entries.set(key, entry)
+    await this.append(entry)
+    return entry
+  }
+
+  async get(key: string): Promise<LakeEntry | undefined> {
+    await this.ensureLoaded()
+    return this.entries.get(key)
+  }
+
+  async search(pattern: string, maxResults = 10): Promise<LakeEntry[]> {
+    await this.ensureLoaded()
+    let re: RegExp
+    try {
+      re = new RegExp(pattern, "i")
+    } catch {
+      re = new RegExp(escapeRegex(pattern), "i")
+    }
+    const results: LakeEntry[] = []
+    for (const e of this.entries.values()) {
+      if (re.test(e.content) || re.test(e.key) || e.tags.some((t) => re.test(t))) {
+        results.push(e)
+        if (results.length >= maxResults) break
+      }
+    }
+    return results
+  }
+
+  async find(text: string, maxResults = 10): Promise<LakeEntry[]> {
+    await this.ensureLoaded()
+    const needle = text.toLowerCase()
+    const results: LakeEntry[] = []
+    for (const e of this.entries.values()) {
+      if (e.content.toLowerCase().includes(needle) || e.key.toLowerCase().includes(needle)) {
+        results.push(e)
+        if (results.length >= maxResults) break
+      }
+    }
+    return results
+  }
+
+  async forget(pattern: string): Promise<number> {
+    await this.ensureLoaded()
+    let re: RegExp
+    try {
+      re = new RegExp(pattern, "i")
+    } catch {
+      re = new RegExp(escapeRegex(pattern), "i")
+    }
+    let removed = 0
+    for (const [k, e] of this.entries) {
+      if (re.test(e.key) || re.test(e.content)) {
+        this.entries.delete(k)
+        removed++
+      }
+    }
+    if (removed > 0) await this.rewrite()
+    return removed
+  }
+
+  async stats(): Promise<{ entries: number; chars: number; keys: string[] }> {
+    await this.ensureLoaded()
+    let chars = 0
+    for (const e of this.entries.values()) chars += e.content.length
+    return { entries: this.entries.size, chars, keys: [...this.entries.keys()] }
+  }
+
+  async captureIfLarge(toolName: string, callID: string, output: string, sessionID: string) {
+    if (!output || output.length < LAKE_CAPTURE_MIN_CHARS) return
+    await this.ensureLoaded()
+    if (this.entries.size >= LAKE_MAX_ENTRIES) return
+    const key = `auto:${toolName}:${createHash("sha256").update(callID).digest("hex").slice(0, 12)}`
+    if (this.entries.has(key)) return
+    await this.store(key, output.slice(0, 200_000), [toolName, `session:${sessionID}`], "tool-capture")
+  }
+}
+
+function snippet(entry: LakeEntry, needle: string, width = 160): string {
+  const idx = entry.content.toLowerCase().indexOf(needle.toLowerCase())
+  if (idx < 0) return entry.content.slice(0, width)
+  const start = Math.max(0, idx - width / 2)
+  return (start > 0 ? "…" : "") + entry.content.slice(start, start + width) + "…"
+}
+
 // ─── Plugin ──────────────────────────────────────────────────────────────────
 
-const RLM_INSTRUCTIONS = `## RLM Programming Model (persistent Python kernel)
+const RLM_INSTRUCTIONS = `## RLM Programming Model (persistent Python kernel + context lake)
 
 You have an RLM-style persistent Python kernel via the \`ipython\` tool:
 
@@ -268,6 +449,14 @@ You have an RLM-style persistent Python kernel via the \`ipython\` tool:
 - Use \`%%bash\` cells for shell commands; \`%cd <dir>\` changes the kernel's working directory persistently.
 - Output is capped and concise on purpose: query specific values with small cells instead of dumping large data into the conversation.
 - After heavy data work, call \`rlm_snapshot\` so the state survives compaction; after a compaction, call \`rlm_restore\` to reload it.
+
+Context lake (context folding — data that never enters the prompt):
+
+- \`rlm_store\` saves large data (outputs, reference material, logs) to a persistent per-project lake. Stored data is NOT in your context.
+- \`rlm_search\` (regex) and \`rlm_find\` (text) locate entries and return only snippets; \`rlm_get\` loads a full entry by key; \`rlm_stats\` lists keys; \`rlm_forget\` deletes.
+- FROM THE KERNEL: \`rlm_lake.store(key, data)\` writes a kernel variable straight into the lake (no prompt round-trip — ideal for big data); \`rlm_lake.get/search/find/stats/forget\` mirror the tools.
+- Large tool outputs (>10KB) are auto-captured into the lake under \`auto:<tool>:<hash>\` keys — search them instead of re-running the tool.
+- Prefer storing big data in the kernel or the lake over printing it into the conversation.
 
 Subagents (RLM children):
 
@@ -279,6 +468,16 @@ export const Rlm: Plugin = async ({ client, directory }) => {
   const kernels = new Map<string, Kernel>()
   const children = new Map<string, any[]>()   // sessionID -> child entries
   const parents = new Map<string, string>()   // sessionID -> parentID
+  const lakes = new Map<string, ContextLake>() // projectDir -> lake
+
+  function lakeFor(projectDir: string): ContextLake {
+    let lake = lakes.get(projectDir)
+    if (!lake) {
+      lake = new ContextLake(projectDir)
+      lakes.set(projectDir, lake)
+    }
+    return lake
+  }
 
   function depthOf(sessionID: string): number {
     let depth = 1
@@ -295,7 +494,7 @@ export const Rlm: Plugin = async ({ client, directory }) => {
   async function getKernel(sessionID: string, cwd: string): Promise<Kernel> {
     let k = kernels.get(sessionID)
     if (k) return k
-    k = new Kernel(pythonBin(), kernelPath(), sessionID, cwd)
+    k = new Kernel(pythonBin(), kernelPath(), sessionID, cwd, lakeFileFor(cwd))
     kernels.set(sessionID, k)
     try {
       await k.ready
@@ -550,6 +749,120 @@ export const Rlm: Plugin = async ({ client, directory }) => {
           return `Restored ${ev.names?.length ?? 0} variables from ${file}.`
         },
       }),
+
+      // ── Context lake tools (context folding — RLM paper) ──────────────
+
+      rlm_store: tool({
+        description:
+          "Store a context entry in the persistent context lake. Data stored here does NOT enter the LLM prompt — " +
+          "retrieve it later with rlm_get / rlm_search / rlm_find. Use for large outputs, reference data, or anything " +
+          "you want available later without re-sending it into context.",
+        args: {
+          key: tool.schema.string().describe("Unique key for the entry"),
+          content: tool.schema.string().describe("Content to store (can be large)"),
+          tags: tool.schema
+            .array(tool.schema.string())
+            .optional()
+            .describe("Optional tags to help search"),
+        },
+        async execute(args, context) {
+          const lake = lakeFor(context.directory)
+          const entry = await lake.store(args.key, args.content, args.tags ?? [], "model")
+          return `Stored "${args.key}" (${entry.content.length} chars, tags: ${entry.tags.join(",") || "none"}). ` +
+            `It is NOT in the LLM context — retrieve with rlm_get / rlm_search / rlm_find.`
+        },
+      }),
+
+      rlm_get: tool({
+        description:
+          "Retrieve a context entry from the context lake by exact key. Returns the stored content (truncated to 50KB).",
+        args: {
+          key: tool.schema.string().describe("Entry key (see rlm_stats for keys)"),
+        },
+        async execute(args, context) {
+          const lake = lakeFor(context.directory)
+          const entry = await lake.get(args.key)
+          if (!entry) return `No entry "${args.key}" in the context lake. Use rlm_stats to list keys.`
+          const content =
+            entry.content.length > LAKE_GET_MAX_CHARS
+              ? entry.content.slice(0, LAKE_GET_MAX_CHARS) +
+                `\n...[truncated, ${entry.content.length} chars total; use rlm_search for targeted retrieval]...`
+              : entry.content
+          return `[${args.key}] (${entry.content.length} chars, updated ${new Date(entry.updated).toISOString()})\n${content}`
+        },
+      }),
+
+      rlm_search: tool({
+        description:
+          "Regex-search the context lake. Returns matching entry keys with a snippet around the first match. " +
+          "Use to find specific data without loading whole entries into context.",
+        args: {
+          pattern: tool.schema.string().describe("Regex pattern (case-insensitive)"),
+          max_results: tool.schema.number().optional().describe("Max matches (default 10)"),
+        },
+        async execute(args, context) {
+          const lake = lakeFor(context.directory)
+          const results = await lake.search(args.pattern, args.max_results ?? 10)
+          if (results.length === 0) return `No entries match /${args.pattern}/ in the context lake.`
+          return results
+            .map(
+              (e, i) =>
+                `${i + 1}. ${e.key} (${e.content.length} chars, tags: ${e.tags.join(",") || "none"})\n` +
+                `   ${snippet(e, args.pattern)}`
+            )
+            .join("\n")
+        },
+      }),
+
+      rlm_find: tool({
+        description:
+          "Find context lake entries containing an exact text (case-insensitive substring). " +
+          "Returns matching keys with a snippet around the first occurrence.",
+        args: {
+          text: tool.schema.string().describe("Text to find"),
+          max_results: tool.schema.number().optional().describe("Max matches (default 10)"),
+        },
+        async execute(args, context) {
+          const lake = lakeFor(context.directory)
+          const results = await lake.find(args.text, args.max_results ?? 10)
+          if (results.length === 0) return `No entries contain "${args.text}" in the context lake.`
+          return results
+            .map(
+              (e, i) =>
+                `${i + 1}. ${e.key} (${e.content.length} chars)\n` + `   ${snippet(e, args.text)}`
+            )
+            .join("\n")
+        },
+      }),
+
+      rlm_stats: tool({
+        description: "Show context lake statistics: entry count, total chars, and all keys.",
+        args: {},
+        async execute(_args, context) {
+          const lake = lakeFor(context.directory)
+          const s = await lake.stats()
+          if (s.entries === 0) return "Context lake is empty. Store data with rlm_store."
+          return (
+            `Context lake: ${s.entries} entries, ${s.chars.toLocaleString()} chars total.\n` +
+            `Keys:\n${s.keys.map((k) => `- ${k}`).join("\n")}`
+          )
+        },
+      }),
+
+      rlm_forget: tool({
+        description:
+          "Delete context lake entries whose key or content matches a regex pattern. Returns the number removed.",
+        args: {
+          pattern: tool.schema.string().describe("Regex pattern (case-insensitive)"),
+        },
+        async execute(args, context) {
+          const lake = lakeFor(context.directory)
+          const removed = await lake.forget(args.pattern)
+          return removed > 0
+            ? `Removed ${removed} entr${removed === 1 ? "y" : "ies"} matching /${args.pattern}/.`
+            : `No entries match /${args.pattern}/.`
+        },
+      }),
     },
 
     event: async ({ event }) => {
@@ -560,6 +873,20 @@ export const Rlm: Plugin = async ({ client, directory }) => {
       if (event.type === "session.deleted") {
         const info = (event.properties as any)?.info
         if (info?.id) cleanupSession(info.id)
+      }
+    },
+
+    // Auto-capture large tool outputs into the context lake so they stay
+    // retrievable without ever re-entering the LLM prompt.
+    "tool.execute.after": async (input, output) => {
+      try {
+        const text = typeof output?.output === "string" ? output.output : ""
+        if (text.length >= LAKE_CAPTURE_MIN_CHARS) {
+          const lake = lakeFor(directory)
+          await lake.captureIfLarge(input.tool, input.callID, text, input.sessionID)
+        }
+      } catch {
+        // Best-effort: capture must never break tool execution.
       }
     },
 

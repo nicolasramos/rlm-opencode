@@ -17,7 +17,7 @@ KERNEL = os.path.join(os.path.dirname(__file__), "..", "kernel", "kernel.py")
 
 
 class Kernel:
-    def __init__(self, python: str = sys.executable):
+    def __init__(self, python: str = sys.executable, env: dict | None = None):
         self.proc = subprocess.Popen(
             [python, KERNEL],
             stdin=subprocess.PIPE,
@@ -25,6 +25,7 @@ class Kernel:
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
+            env={**os.environ, **(env or {})},
         )
         self._next_id = 0
         # Wait for ready
@@ -161,6 +162,27 @@ def main():
         r = k.execute("list(range(100000))")
         check("repr capped", r["result"] and len(r["result"]["repr"]) <= 5_000,
               f"len={len(r['result']['repr']) if r['result'] else '?'}")
+
+        # 16. rlm_lake bridge: store from kernel, read back, cross-check file
+        lake_dir = tempfile.mkdtemp()
+        lake_file = os.path.join(lake_dir, "lake.jsonl")
+        k2 = Kernel(python, env={"RLM_LAKE_FILE": lake_file})
+        try:
+            r = k2.execute("rlm_lake.store('testkey', 'hello lake ' * 100, ['tag1'])")
+            check("rlm_lake.store", r["result"] and r["result"]["ok"], str(r))
+            r = k2.execute("rlm_lake.get('testkey')")
+            check("rlm_lake.get", r["result"] and "hello lake" in r["result"]["repr"], str(r))
+            r = k2.execute("rlm_lake.search('hello')")
+            check("rlm_lake.search", r["result"] and "testkey" in r["result"]["repr"], str(r))
+            r = k2.execute("rlm_lake.stats()")
+            check("rlm_lake.stats", r["result"] and "testkey" in r["result"]["repr"], str(r))
+            # The entry must be on disk (plugin tools read the same file)
+            with open(lake_file, encoding="utf-8") as f:
+                content = f.read()
+            check("rlm_lake persisted to disk", "testkey" in content and "hello lake" in content,
+                  f"file={content[:80]!r}")
+        finally:
+            k2.close()
 
         print("\nAll kernel tests passed.")
     finally:

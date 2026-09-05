@@ -52,10 +52,12 @@ import json
 import os
 import pickle
 import queue
+import re
 import signal
 import subprocess
 import sys
 import threading
+import time
 import traceback
 import types
 import uuid
@@ -72,7 +74,7 @@ MAX_NAME_REPR_CHARS = 200    # per-name repr in list_names
 # Names the bootstrap re-creates on every start; never snapshotted/listed.
 _ALWAYS_SKIP = {
     "rlm", "mcp", "bash", "asyncio", "In", "Out", "get_ipython",
-    "exit", "quit", "open", "display",
+    "exit", "quit", "open", "display", "rlm_lake",
 }
 
 # ─── Protocol plumbing ────────────────────────────────────────────────────────
@@ -316,6 +318,133 @@ def _list_names() -> list[dict[str, str]]:
     return names
 
 
+# ─── Context lake bridge (kernel ↔ lake, no prompt round-trip) ───────────────
+# The model generates data in the kernel, then calls rlm_lake.store(key, data)
+# to write it straight into the context lake file. The data never passes
+# through tool arguments (which would enter the LLM prompt).
+
+class _LakeBridge:
+    """Minimal JSONL context-lake client usable from kernel cells.
+
+    Reads RLM_LAKE_FILE (set by the plugin when spawning the kernel). All
+    methods are synchronous and safe to call from any cell.
+    """
+
+    def __init__(self) -> None:
+        self._file = os.environ.get("RLM_LAKE_FILE", "")
+        self._entries: dict[str, dict[str, Any]] = {}
+        self._loaded = False
+        self._last_mtime = 0.0
+
+    def _ensure(self) -> None:
+        if not self._file:
+            return
+        try:
+            mtime = os.path.getmtime(self._file) if os.path.exists(self._file) else 0.0
+        except OSError:
+            mtime = 0.0
+        if self._loaded and mtime <= self._last_mtime:
+            return
+        self._loaded = True
+        self._last_mtime = mtime
+        self._entries.clear()
+        try:
+            if os.path.exists(self._file):
+                with open(self._file, encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            e = json.loads(line)
+                            if e.get("key"):
+                                self._entries[e["key"]] = e
+                        except json.JSONDecodeError:
+                            continue
+        except OSError:
+            pass
+
+    def _append(self, entry: dict[str, Any]) -> None:
+        if not self._file:
+            raise RuntimeError("context lake is not configured (RLM_LAKE_FILE unset)")
+        os.makedirs(os.path.dirname(self._file), exist_ok=True)
+        with open(self._file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    def store(self, key: str, content: Any, tags: list[str] | None = None) -> dict[str, Any]:
+        """Store a value (str, list, dict...) in the context lake under key."""
+        if not isinstance(key, str) or not key:
+            raise TypeError("key must be a non-empty str")
+        if not isinstance(content, str):
+            content = json.dumps(content, ensure_ascii=False, default=str)
+        self._ensure()
+        now = time.time()
+        entry = {
+            "key": key,
+            "content": content,
+            "tags": tags or [],
+            "source": "kernel",
+            "created": self._entries.get(key, {}).get("created", now),
+            "updated": now,
+        }
+        self._entries[key] = entry
+        self._append(entry)
+        return {"key": key, "chars": len(content), "tags": entry["tags"]}
+
+    def get(self, key: str) -> str | None:
+        self._ensure()
+        e = self._entries.get(key)
+        return e["content"] if e else None
+
+    def search(self, pattern: str, max_results: int = 10) -> list[dict[str, Any]]:
+        self._ensure()
+        try:
+            re_obj = re.compile(pattern, re.IGNORECASE)
+        except re.error:
+            re_obj = re.compile(re.escape(pattern), re.IGNORECASE)
+        out = []
+        for e in self._entries.values():
+            if re_obj.search(e.get("content", "")) or re_obj.search(e.get("key", "")):
+                out.append({"key": e["key"], "chars": len(e.get("content", "")), "tags": e.get("tags", [])})
+                if len(out) >= max_results:
+                    break
+        return out
+
+    def find(self, text: str, max_results: int = 10) -> list[dict[str, Any]]:
+        self._ensure()
+        needle = text.lower()
+        out = []
+        for e in self._entries.values():
+            if needle in e.get("content", "").lower() or needle in e.get("key", "").lower():
+                out.append({"key": e["key"], "chars": len(e.get("content", "")), "tags": e.get("tags", [])})
+                if len(out) >= max_results:
+                    break
+        return out
+
+    def stats(self) -> dict[str, Any]:
+        self._ensure()
+        chars = sum(len(e.get("content", "")) for e in self._entries.values())
+        return {"entries": len(self._entries), "chars": chars, "keys": sorted(self._entries)}
+
+    def forget(self, pattern: str) -> int:
+        self._ensure()
+        try:
+            re_obj = re.compile(pattern, re.IGNORECASE)
+        except re.error:
+            re_obj = re.compile(re.escape(pattern), re.IGNORECASE)
+        removed = [k for k, e in self._entries.items() if re_obj.search(k) or re_obj.search(e.get("content", ""))]
+        for k in removed:
+            del self._entries[k]
+        if removed and self._file:
+            with open(self._file, "w", encoding="utf-8") as f:
+                for e in self._entries.values():
+                    f.write(json.dumps(e, ensure_ascii=False) + "\n")
+        return len(removed)
+
+
+rlm_lake = _LakeBridge()
+
+
 # ─── Interrupt / timeout ──────────────────────────────────────────────────────
 
 def _deliver_sigint() -> None:
@@ -413,6 +542,7 @@ def main() -> int:
         "__name__": "__main__",
         "__builtins__": __builtins__,
         "emit": emit,
+        "rlm_lake": rlm_lake,
     }
 
     _send({"event": "ready", "version": PROTOCOL_VERSION})

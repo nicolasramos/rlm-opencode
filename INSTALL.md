@@ -38,7 +38,8 @@ cp kernel/kernel.py ~/.config/opencode/rlm-kernel/kernel.py
 1. Abre OpenCode en cualquier proyecto.
 2. Escribe `/help` o mira la lista de tools disponibles — deben aparecer:
    `ipython`, `rlm`, `rlm_list`, `rlm_result`, `rlm_delete`, `rlm_snapshot`,
-   `rlm_restore`.
+   `rlm_restore`, `rlm_store`, `rlm_get`, `rlm_search`, `rlm_find`,
+   `rlm_stats`, `rlm_forget`.
 3. Prueba rápida: pídele al modelo *"usa ipython para calcular 6*7"* — debe
    responder 42.
 
@@ -110,6 +111,15 @@ El estado (variables, imports, funciones) **sobrevive entre llamadas**:
 - `rlm_restore` — lo recupera (útil tras una compactación o reinicio).
 - La compactación de OpenCode hace snapshot automático e inyecta un resumen
   de variables en el prompt de compactación.
+
+### Lago de contexto (datos que nunca entran en el prompt)
+
+- `rlm_store` — guarda datos grandes en el lago persistente del proyecto.
+- `rlm_get` / `rlm_search` / `rlm_find` — recupera por clave, regex o texto
+  (solo snippets).
+- `rlm_stats` / `rlm_forget` — estadísticas y limpieza.
+- Salidas de tools >10KB se capturan automáticamente en el lago
+  (`auto:<tool>:<hash>`).
 
 ## Solución de problemas
 
