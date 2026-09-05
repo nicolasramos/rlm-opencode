@@ -1,0 +1,20 @@
+# Node / Bun
+node_modules/
+*.log
+
+# OpenCode state
+.opencode/
+rlm-state/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# Editor
+.idea/
+.vscode/
