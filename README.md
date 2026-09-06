@@ -4,6 +4,8 @@
 
 RLM is a research paradigm introduced by [Alex Zhang (October 2025)](https://alexzhang13.github.io/blog/2025/rlm/) and formalized in the paper [*Recursive Language Models* (arXiv:2512.24601)](https://arxiv.org/abs/2512.24601). This plugin implements that paradigm for OpenCode: the model keeps working state in a persistent Python kernel, spawns recursive subagents, and stores large context in an external lake it queries with tools — instead of stuffing everything into the prompt. Self-contained: no external runtime dependency.
 
+Companion project: [rlm-pi](https://github.com/nicolasramos/rlm-pi) (the same RLM for PI). Both share the same kernel runtime and the same context-lake format, so state is portable between editors.
+
 ---
 
 ## Why RLM?
@@ -16,6 +18,38 @@ RLM:          Context → kernel / lake (external) → LLM calls tools to get on
 ```
 
 The model keeps working state in a **persistent Python kernel** and large reference data in a **context lake**, then queries both with small tool calls. The big data **never enters the prompt**.
+
+### When does RLM help most?
+
+| Situation | Without RLM | With RLM |
+|---|---|---|
+| Logs, build output, CSV dumps (100KB–10MB) | Prompt overflow or huge token bills | Stored in kernel/lake; model queries snippets |
+| Multi-step data pipelines (transform → analyze → report) | Every step re-reads and re-sends data | Variables survive in the kernel between steps |
+| Long agent sessions (compaction) | State lost or re-summarized | Snapshot + variable summary injected at compaction |
+| Local models with small context (1–8K) | **Cannot** process large data at all | Model writes code; kernel does the heavy lifting |
+| Parallelizable review/analysis tasks | Serial, blocking | Background subagents with admission handles |
+
+## Impact study: local models vs frontier models (measured 2026-09-06)
+
+Same task in both modes — find `NEEDLE-7A3F` in a 5,000-line log file (~280 KB ≈ **130,000 tokens**):
+
+- **Mode A (prompt)**: the data is injected into the LLM prompt.
+- **Mode B (RLM)**: the model only writes a small Python snippet; the kernel executes it against the file.
+
+| Model | Type | Mode A (data in prompt) | Mode B (RLM) |
+|---|---|---|---|
+| LFM2.5-1.2B (local) | small | ❌ **Prompt too long: 130,034 tok > 128K ctx** | ✅ **75 tok · 0.6s** |
+| LFM2.5-2.6B (local) | small | ❌ **Prompt too long: 130,033 tok** | ✅ **73 tok · 4.3s** |
+| LFM2.5-8B-A1B (local) | mid | ❌ **Prompt too long: 130,032 tok** | ✅ **72 tok · 3.7s** |
+| Qwen3.6-35B-A3B (local) | large local | ❌ **OOM: memory guard aborted prefill (27.9 GB)** | ✅ (needs free RAM) |
+| deepseek-v4-flash (cloud) | frontier | ✅ 125,106 tok · 7.4s | ✅ 387–1,374 tok |
+
+**What this proves:**
+
+1. **Small local models cannot process large data in the prompt** — not even a 128K-context server: the file exceeds the window. With RLM they succeed with **72–75 tokens in under 5 seconds**.
+2. **Large local models cannot either** — the prefill of 130K tokens needs ~21–28 GB of KV cache + attention, which trips the memory guard.
+3. **Frontier models can** (125,106 tokens, 7.4s) — but they pay **125,106 tokens per request**. With RLM the same task costs **387–1,374 tokens**: a **90–1,700× reduction**.
+4. RLM is therefore **not an optional optimization for small local models — it is what makes them capable** of working with real data. The model becomes an orchestrator of code, not a reader of documents.
 
 ## What you get
 
@@ -88,9 +122,13 @@ Optional env vars:
 
 State lives in `~/.config/opencode/rlm-state/` (kernel snapshots per session, context lake per project).
 
-## Usage
+## Usage — complete documentation
 
-### Persistent kernel
+### 1. Persistent kernel (`ipython`)
+
+The kernel is a durable CPython REPL. Everything you define survives across calls — variables, imports, functions, even the working directory.
+
+**Basic state persistence:**
 
 ```text
 > Store the first 5 primes in a variable, then double the last one.
@@ -100,9 +138,36 @@ State lives in `~/.config/opencode/rlm-state/` (kernel snapshots per session, co
 → 22
 ```
 
-The state survives across calls, compaction, and (with `rlm_snapshot`/`rlm_restore`) restarts.
+**Shell access with `%%bash`:**
 
-### Background subagents
+```text
+⚙ ipython {"code": "%%bash\ngit log --oneline -5"}
+→ 9d29dede2 feat: add HermesApp iOS scaffold
+  772be82c7 auto-sync 2026-07-22 18:21
+  ...
+```
+
+**Persistent working directory with `%cd`:**
+
+```text
+⚙ ipython {"code": "%cd /tmp/project"}
+→ /tmp/project
+⚙ ipython {"code": "import os; os.getcwd()"}
+→ '/tmp/project'
+```
+
+**Top-level `await`:**
+
+```text
+⚙ ipython {"code": "import asyncio; await asyncio.sleep(0.1); 'done'"}
+→ 'done'
+```
+
+**Output caps**: stdout is capped at 100KB and expression reprs at 4K chars, so the model receives concise results and queries specific values with small cells instead of dumping data into the conversation.
+
+### 2. Background subagents (`rlm`, `rlm_list`, `rlm_result`, `rlm_delete`)
+
+Spawn a child session that works in the background while you keep going. You get an admission handle immediately (RLM semantics); results arrive later.
 
 ```text
 > Review the auth flow in the background while I keep working.
@@ -110,11 +175,21 @@ The state survives across calls, compaction, and (with `rlm_snapshot`/`rlm_resto
 ⚙ rlm {"prompt": "Review the authentication flow for security issues", "name": "auth-reviewer"}
 → {"rlm_child_id": "ses_...", "name": "auth-reviewer", "status": "running"}
 
+⚙ rlm_list {}
+→ [{"name": "auth-reviewer", "status": "running", "created": "..."}]
+
 ⚙ rlm_result {"child": "auth-reviewer"}
 → {"status": "completed", "text": "..."}
+
+⚙ rlm_delete {"child": "auth-reviewer"}
+→ {"deleted": true}
 ```
 
-### Context lake (data that never enters the prompt)
+Children inherit the parent model and tools, get their own session (and their own kernel), and recursion depth is limited to 2.
+
+### 3. Context lake (`rlm_store`, `rlm_get`, `rlm_search`, `rlm_find`, `rlm_stats`, `rlm_forget`)
+
+Large data lives in a per-project JSONL store. The model stores it once and queries snippets on demand — the data **never enters the prompt**.
 
 ```text
 > Store the full build log in the lake, then find the failing test.
@@ -124,7 +199,37 @@ The state survives across calls, compaction, and (with `rlm_snapshot`/`rlm_resto
 ⚙ rlm_search {"pattern": "FAILED|error"}                       # snippets only
 → 1. build-log (2,048,000 chars)
    …FAILED test_api_orders — AssertionError: expected 200…
+
+⚙ rlm_get {"key": "build-log"}                                 # full entry (capped 50KB)
+⚙ rlm_find {"query": "AssertionError"}                         # text search
+⚙ rlm_stats {}
+→ {"entries": 12, "total_chars": 2_500_000, "file": "..."}
+⚙ rlm_forget {"key": "build-log"}
+→ {"deleted": true}
 ```
+
+**From inside the kernel** — the `rlm_lake` module writes a kernel variable straight into the lake without any prompt round-trip:
+
+```text
+⚙ ipython {"code": "rlm_lake.store('biglogs', logs)"}          # 200KB → lake, 0 tokens spent
+```
+
+**Auto-capture**: any tool output larger than 10KB is automatically stored in the lake under `auto:<tool>:<hash>` keys, so large results stay retrievable without re-running the tool.
+
+### 4. Snapshot / restore (`rlm_snapshot`, `rlm_restore`)
+
+Persist the whole kernel namespace to disk and reload it later — survives compaction and restarts.
+
+```text
+⚙ ipython {"code": "primes = [2, 3, 5, 7, 11]"}
+⚙ rlm_snapshot {"name": "session-1"}
+→ {"snapshot": "session-1", "names": ["primes", ...]}
+
+⚙ rlm_restore {"name": "session-1"}
+→ {"restored": ["primes", ...]}
+```
+
+The `session.compacting` hook does this automatically: before compaction, the kernel is snapshotted and a summary of its variables is injected into the compaction prompt, so the model knows what state exists after the context is trimmed.
 
 ## Keeping context out of the LLM — proof
 
@@ -167,31 +272,38 @@ The kernel executes model-generated Python with your OS permissions. It is a dur
 ## Tests
 
 ```bash
-python3 tests/test_kernel.py        # 20/20 kernel protocol tests
+python3 tests/test_kernel.py        # 24/24 kernel protocol tests
 node tests/e2e_battery.mjs          # E2E battery (needs a running opencode server + model)
 ```
+
+## FAQ
+
+**Does RLM replace the model's context window?** No — it complements it. The context window is reserved for reasoning and instructions; data lives in the kernel/lake.
+
+**Does it work with any model?** Yes. RLM is model-agnostic: the model only needs basic tool-calling. It helps frontier models (token savings) and is *required* for small local models (they cannot fit large data in the prompt).
+
+**What happens on compaction?** The kernel is snapshotted automatically and a summary of its variables is injected into the compaction prompt. After compaction, the model can restore or query the kernel/lake.
+
+**Where does state live?** `~/.config/opencode/rlm-state/` — kernel snapshots per session, context lake per project (JSONL).
+
+**Can I use it with my own Python environment?** Yes — set `RLM_KERNEL_PYTHON` to any interpreter (venv, conda, system).
+
+**Is the data sent anywhere?** No. Everything runs locally: kernel, lake, and (with a local model) the LLM itself. Your data never leaves your machine.
 
 ## Publishing
 
 ### OpenCode
 
-OpenCode plugins are published as **npm packages** and listed in the community
-ecosystem. There is no central "store" — the distribution paths are:
+OpenCode plugins are published as **npm packages** and listed in the community ecosystem. There is no central "store" — the distribution paths are:
 
-1. **npm** — `npm publish` (the repo ships a `package.json`; users install via
-   the `plugin` array in `opencode.json`).
-2. **Ecosystem page** — [opencode.ai/docs/ecosystem](https://opencode.ai/docs/ecosystem)
-   lists community plugins (PR to the docs).
-3. **Community lists** — [awesome-opencode](https://github.com/awesome-opencode/awesome-opencode)
-   and [opencode.cafe](https://opencode.cafe).
+1. **npm** — `npm publish` (the repo ships a `package.json`; users install via the `plugin` array in `opencode.json`).
+2. **Ecosystem page** — [opencode.ai/docs/ecosystem](https://opencode.ai/docs/ecosystem) lists community plugins (PR to the docs).
+3. **Community lists** — [awesome-opencode](https://github.com/awesome-opencode/awesome-opencode) and [opencode.cafe](https://opencode.cafe).
 4. **Local install** — copy `plugin/rlm.ts` to `~/.config/opencode/plugins/`.
 
 ### PI (pi-mono)
 
-PI has a real plugin registry: **https://pi.dev/packages** (5,000+ packages).
-Extensions are npm packages installed under `~/.pi/agent/` or copied to
-`~/.pi/agent/extensions/`. The `pi-extension/` directory in this repo contains
-the RLM port for PI (same kernel, same lake format).
+PI has a real plugin registry: **https://pi.dev/packages** (5,000+ packages). Extensions are npm packages installed under `~/.pi/agent/` or copied to `~/.pi/agent/extensions/`. The companion project [rlm-pi](https://github.com/nicolasramos/rlm-pi) contains the RLM port for PI (same kernel, same lake format).
 
 ## License
 
