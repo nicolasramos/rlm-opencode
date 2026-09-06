@@ -54,6 +54,16 @@ One kernel per OpenCode session, spawned lazily on first `ipython` use. Children
 
 Requirements: OpenCode ≥ 1.18, Python 3.9+ (3.11+ recommended, stdlib only; `dill` optional for richer snapshots).
 
+**Via npm** (published as `rlm-opencode`):
+
+```bash
+npm install -g rlm-opencode
+rlm-opencode-install   # copies plugin + kernel to ~/.config/opencode/
+# restart opencode
+```
+
+**Via git**:
+
 ```bash
 git clone https://github.com/nicolasramos/rlm-opencode.git
 cd rlm-opencode

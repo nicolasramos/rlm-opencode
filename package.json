@@ -10,10 +10,14 @@
   "files": [
     "plugin",
     "kernel",
+    "install.js",
     "README.md",
     "INSTALL.md",
     "LICENSE"
   ],
+  "bin": {
+    "rlm-opencode-install": "install.js"
+  },
   "scripts": {
     "test": "python3 tests/test_kernel.py"
   },
