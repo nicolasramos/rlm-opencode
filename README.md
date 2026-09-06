@@ -2,7 +2,9 @@
 
 **RLM (Recursive Language Model) for OpenCode** — a persistent Python kernel, native background subagents, and a context lake that keeps large data **out of the LLM prompt**.
 
-Ported from [Prime Agent](https://github.com/PrimeIntellect-ai/prime-agent)'s RLM runtime and the [RLM paper (arXiv:2512.24601)](https://arxiv.org/abs/2512.24601). Self-contained: no dependency on prime-agent.
+RLM is a research paradigm introduced by [Alex Zhang (October 2025)](https://alexzhang13.github.io/blog/2025/rlm/) and formalized in the paper [*Recursive Language Models* (arXiv:2512.24601)](https://arxiv.org/abs/2512.24601). This plugin implements that paradigm for OpenCode: the model keeps working state in a persistent Python kernel, spawns recursive subagents, and stores large context in an external lake it queries with tools — instead of stuffing everything into the prompt.
+
+The kernel + subagent runtime design follows the same architecture as prime-agent's RLM runtime, which we studied as a reference implementation of the paradigm. Self-contained: no dependency on prime-agent.
 
 ---
 
@@ -160,6 +162,28 @@ The kernel executes model-generated Python with your OS permissions. It is a dur
 python3 tests/test_kernel.py        # 20/20 kernel protocol tests
 node tests/e2e_battery.mjs          # E2E battery (needs a running opencode server + model)
 ```
+
+## Publishing
+
+### OpenCode
+
+OpenCode plugins are published as **npm packages** and listed in the community
+ecosystem. There is no central "store" — the distribution paths are:
+
+1. **npm** — `npm publish` (the repo ships a `package.json`; users install via
+   the `plugin` array in `opencode.json`).
+2. **Ecosystem page** — [opencode.ai/docs/ecosystem](https://opencode.ai/docs/ecosystem)
+   lists community plugins (PR to the docs).
+3. **Community lists** — [awesome-opencode](https://github.com/awesome-opencode/awesome-opencode)
+   and [opencode.cafe](https://opencode.cafe).
+4. **Local install** — copy `plugin/rlm.ts` to `~/.config/opencode/plugins/`.
+
+### PI (pi-mono)
+
+PI has a real plugin registry: **https://pi.dev/packages** (5,000+ packages).
+Extensions are npm packages installed under `~/.pi/agent/` or copied to
+`~/.pi/agent/extensions/`. The `pi-extension/` directory in this repo contains
+the RLM port for PI (same kernel, same lake format).
 
 ## License
 

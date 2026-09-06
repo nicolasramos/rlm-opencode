@@ -1,0 +1,34 @@
+{
+  "name": "rlm-opencode",
+  "version": "0.2.0",
+  "description": "RLM (Recursive Language Model) for OpenCode: persistent Python kernel, background subagents, and a context lake that keeps large data out of the LLM prompt",
+  "type": "module",
+  "main": "plugin/rlm.ts",
+  "exports": {
+    ".": "./plugin/rlm.ts"
+  },
+  "files": [
+    "plugin",
+    "kernel",
+    "README.md",
+    "INSTALL.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "python3 tests/test_kernel.py"
+  },
+  "keywords": [
+    "opencode",
+    "plugin",
+    "rlm",
+    "recursive-language-model",
+    "python",
+    "kernel",
+    "subagents",
+    "context"
+  ],
+  "license": "MIT",
+  "engines": {
+    "bun": ">=1.0"
+  }
+}
