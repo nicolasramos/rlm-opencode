@@ -1,7 +1,7 @@
 /**
  * rlm — RLM (Recursive Language Model) plugin for OpenCode
  *
- * Ports the core ideas of Prime Agent's RLM runtime to OpenCode:
+ * Implements the RLM paradigm (arXiv:2512.24601) for OpenCode:
  *
  *   1. Persistent Python kernel — the `ipython` tool executes code in a
  *      durable CPython REPL subprocess. Variables, imports, functions and
@@ -14,9 +14,11 @@
  *   3. State outliving turns — `rlm_snapshot` / `rlm_restore` persist the
  *      kernel namespace to disk; the compaction hook snapshots automatically
  *      and injects a summary of kernel variables into the compaction prompt.
+ *   4. Context lake — `rlm_store` / `rlm_get` / `rlm_search` / `rlm_find`
+ *      keep large data in a per-project store that never enters the prompt.
  *
  * The kernel is a self-contained Python runtime (kernel/kernel.py) speaking
- * newline-delimited JSON over stdio — no dependency on prime-agent.
+ * newline-delimited JSON over stdio.
  *
  * Install: copy this file to ~/.config/opencode/plugins/rlm.ts and
  * kernel/kernel.py to ~/.config/opencode/rlm-kernel/kernel.py

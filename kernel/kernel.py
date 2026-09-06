@@ -7,9 +7,9 @@ across execute requests. Supports top-level await, ``%%bash`` cells, ``%cd``,
 per-cell stdout/stderr capture, snapshot/restore, interrupts and timeouts.
 
 This is the "kernel" half of the RLM (recursive language model) programming
-model ported from Prime Agent: the model keeps working state in a durable
-Python control environment instead of re-reading files or re-sending data
-through the LLM context on every turn.
+model (arXiv:2512.24601): the model keeps working state in a durable Python
+control environment instead of re-reading files or re-sending data through
+the LLM context on every turn.
 
 Protocol (one JSON object per line):
 

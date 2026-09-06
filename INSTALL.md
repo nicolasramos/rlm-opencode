@@ -135,8 +135,8 @@ El estado (variables, imports, funciones) **sobrevive entre llamadas**:
 
 El kernel ejecuta Python generado por el modelo con los permisos de tu
 usuario. Es un entorno de control duradero, **no un sandbox de seguridad**
-(mismo modelo de confianza que prime-agent). Para repositorios no confiables,
-usa un sandbox externo.
+(mismo modelo de confianza que otros runtimes RLM). Para repositorios no
+confiables, usa un sandbox externo.
 
 ## Tests
 

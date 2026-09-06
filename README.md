@@ -2,9 +2,7 @@
 
 **RLM (Recursive Language Model) for OpenCode** — a persistent Python kernel, native background subagents, and a context lake that keeps large data **out of the LLM prompt**.
 
-RLM is a research paradigm introduced by [Alex Zhang (October 2025)](https://alexzhang13.github.io/blog/2025/rlm/) and formalized in the paper [*Recursive Language Models* (arXiv:2512.24601)](https://arxiv.org/abs/2512.24601). This plugin implements that paradigm for OpenCode: the model keeps working state in a persistent Python kernel, spawns recursive subagents, and stores large context in an external lake it queries with tools — instead of stuffing everything into the prompt.
-
-The kernel + subagent runtime design follows the same architecture as prime-agent's RLM runtime, which we studied as a reference implementation of the paradigm. Self-contained: no dependency on prime-agent.
+RLM is a research paradigm introduced by [Alex Zhang (October 2025)](https://alexzhang13.github.io/blog/2025/rlm/) and formalized in the paper [*Recursive Language Models* (arXiv:2512.24601)](https://arxiv.org/abs/2512.24601). This plugin implements that paradigm for OpenCode: the model keeps working state in a persistent Python kernel, spawns recursive subagents, and stores large context in an external lake it queries with tools — instead of stuffing everything into the prompt. Self-contained: no external runtime dependency.
 
 ---
 
@@ -50,7 +48,7 @@ OpenCode server (Bun)
        └─ system.transform hook → RLM usage instructions
 ```
 
-One kernel per OpenCode session, spawned lazily on first `ipython` use. Children get their own session → their own kernel (same as prime-agent). The context lake is per project directory, shared across sessions.
+One kernel per OpenCode session, spawned lazily on first `ipython` use. Children get their own session → their own kernel. The context lake is per project directory, shared across sessions.
 
 ## Install
 
@@ -154,7 +152,7 @@ Per-project JSONL store. `rlm_store` writes entries; `rlm_search` (regex) and `r
 
 ## Security
 
-The kernel executes model-generated Python with your OS permissions. It is a durable control environment, **not a security sandbox** — same trust model as prime-agent. Use an external sandbox for untrusted repositories.
+The kernel executes model-generated Python with your OS permissions. It is a durable control environment, **not a security sandbox** — same trust model as other RLM runtimes. Use an external sandbox for untrusted repositories.
 
 ## Tests
 
