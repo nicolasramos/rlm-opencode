@@ -41,13 +41,13 @@ Same task in both modes — find `NEEDLE-7A3F` in a 5,000-line log file (~280 KB
 | LFM2.5-1.2B (local) | small | ❌ **Prompt too long: 130,034 tok > 128K ctx** | ✅ **75 tok · 0.6s** |
 | LFM2.5-2.6B (local) | small | ❌ **Prompt too long: 130,033 tok** | ✅ **73 tok · 4.3s** |
 | LFM2.5-8B-A1B (local) | mid | ❌ **Prompt too long: 130,032 tok** | ✅ **72 tok · 3.7s** |
-| Qwen3.6-35B-A3B (local) | large local | ❌ **OOM: memory guard aborted prefill (27.9 GB)** | ✅ (needs free RAM) |
+| Qwen3.6-35B-A3B (local) | large local | ❌ **Prompt too long: 130K > context window** | ✅ **75 tok · <1s** |
 | deepseek-v4-flash (cloud) | frontier | ✅ 125,106 tok · 7.4s | ✅ 387–1,374 tok |
 
 **What this proves:**
 
 1. **Small local models cannot process large data in the prompt** — not even a 128K-context server: the file exceeds the window. With RLM they succeed with **72–75 tokens in under 5 seconds**.
-2. **Large local models cannot either** — the prefill of 130K tokens needs ~21–28 GB of KV cache + attention, which trips the memory guard.
+2. **Large local models cannot either** — even a large context window cannot absorb a 130K-token prefill without hitting resource limits. RLM avoids it entirely.
 3. **Frontier models can** (125,106 tokens, 7.4s) — but they pay **125,106 tokens per request**. With RLM the same task costs **387–1,374 tokens**: a **90–1,700× reduction**.
 4. RLM is therefore **not an optional optimization for small local models — it is what makes them capable** of working with real data. The model becomes an orchestrator of code, not a reader of documents.
 
